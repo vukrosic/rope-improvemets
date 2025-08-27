@@ -157,38 +157,26 @@ class ModelConfig:
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
 
 class PyTorchRoPE(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int, correct_impl: bool = True):
+    def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
-        self.correct_impl = correct_impl
-
-        if self.correct_impl:
-            inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-            t = torch.arange(max_seq_len, dtype=torch.float32)
-            freqs = torch.einsum('i,j->ij', t, inv_freq)
-            self.register_buffer('cos', freqs.cos(), persistent=False)
-            self.register_buffer('sin', freqs.sin(), persistent=False)
-        else: # Buggy implementation from original llm.py
-            angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-            angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-            t = torch.arange(max_seq_len, dtype=torch.float32)
-            theta = torch.einsum("i,j -> ij", t, angular_freq)
-            self.register_buffer('cos', theta.cos(), persistent=False)
-            self.register_buffer('sin', theta.sin(), persistent=False)
+        angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.register_buffer('cos', theta.cos(), persistent=False)
+        self.register_buffer('sin', theta.sin(), persistent=False)
 
     def forward(self, x_BTHD: torch.Tensor) -> torch.Tensor:
-        cos = self.cos[None, :x_BTHD.size(-3), None, :].to(x_BTHD.dtype)
-        sin = self.sin[None, :x_BTHD.size(-3), None, :].to(x_BTHD.dtype)
+        cos = self.cos[None, :x_BTHD.size(-3), None, :]
+        sin = self.sin[None, :x_BTHD.size(-3), None, :]
         
-        x1, x2 = x_BTHD.chunk(2, dim=-1)
-        if self.correct_impl:
-            y1 = x1 * cos - x2 * sin
-            y2 = x1 * sin + x2 * cos
-        else: # Buggy implementation
-            y1 = x1 * cos + x2 * sin
-            y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), -1)
+        x1, x2 = x_BTHD.to(torch.float32).chunk(2, dim=-1)
+        
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), -1).type_as(x_BTHD)
 
 class TritonRoPEV2(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -317,7 +305,7 @@ class MinimalLLM(nn.Module):
         self.position_dropout = nn.Dropout(config.dropout)
 
         rope_implementations = {
-            'pytorch': PyTorchRoPE(self.config.d_k, self.config.max_seq_len, correct_impl=False),
+            'pytorch': PyTorchRoPE(self.config.d_k, self.config.max_seq_len),
             'triton_v2': TritonRoPEV2(self.config.d_k, self.config.max_seq_len),
             'triton_v4': TritonRoPEV4(self.config.d_k, self.config.max_seq_len)
         }
