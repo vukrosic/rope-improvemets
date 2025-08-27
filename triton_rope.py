@@ -122,12 +122,12 @@ class TritonRoPE(torch.nn.Module):
         # Prepare output tensor
         output = torch.empty_like(x)
         
-        # Calculate grid size and block size
-        total_elements = batch_size * n_heads * seq_len
-        BLOCK_SIZE = min(triton.next_power_of_2(d_k // 2), 1024)  # Triton limitation
+        # Calculate grid size and block size for 2D grid
+        BLOCK_SIZE = triton.next_power_of_2(d_k // 2)
+        BLOCK_SIZE = min(BLOCK_SIZE, 1024)  # Triton limitation
         
-        # Launch kernel
-        grid = (total_elements,)
+        # 2D grid: (batch_size * n_heads, seq_len)
+        grid = (batch_size * n_heads, seq_len)
         
         rope_kernel[grid](
             x.contiguous(),
