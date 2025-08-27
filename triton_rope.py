@@ -25,20 +25,18 @@ def rope_kernel(
         sin_ptr: Sine values pointer [seq_len, d_k//2]
         output_ptr: Output tensor pointer [batch_size, n_heads, seq_len, d_k]
     """
-    # Get program ID for parallelization
-    pid = tl.program_id(axis=0)
+    # Get program ID
+    pid_batch_head = tl.program_id(axis=0)
+    pid_seq = tl.program_id(axis=1)
     
-    # Calculate which batch, head, and sequence position this thread handles
-    total_seq_positions = batch_size * n_heads * seq_len
+    # Calculate batch and head indices
+    batch_idx = pid_batch_head // n_heads
+    head_idx = pid_batch_head % n_heads
+    seq_idx = pid_seq
     
-    if pid >= total_seq_positions:
+    # Early exit if out of bounds
+    if batch_idx >= batch_size or head_idx >= n_heads or seq_idx >= seq_len:
         return
-    
-    # Decompose the linear index
-    batch_idx = pid // (n_heads * seq_len)
-    remaining = pid % (n_heads * seq_len)
-    head_idx = remaining // seq_len
-    seq_idx = remaining % seq_len
     
     # Calculate half dimension
     half_d_k = d_k // 2
@@ -47,45 +45,38 @@ def rope_kernel(
     base_offset = batch_idx * (n_heads * seq_len * d_k) + head_idx * (seq_len * d_k) + seq_idx * d_k
     
     # Load cos and sin values for this sequence position
-    cos_sin_offset = seq_idx * half_d_k
+    cos_sin_base = seq_idx * half_d_k
     
-    # Process in blocks to handle different d_k sizes
-    for block_start in range(0, half_d_k, BLOCK_SIZE):
-        block_end = min(block_start + BLOCK_SIZE, half_d_k)
-        block_size = block_end - block_start
-        
-        if block_size <= 0:
-            break
-            
-        # Create masks for this block
-        block_mask = tl.arange(0, BLOCK_SIZE) < block_size
-        
-        # Load cos and sin values
-        cos_offset = cos_sin_offset + block_start + tl.arange(0, BLOCK_SIZE)
-        sin_offset = cos_sin_offset + block_start + tl.arange(0, BLOCK_SIZE)
-        
-        cos_vals = tl.load(cos_ptr + cos_offset, mask=block_mask, other=0.0)
-        sin_vals = tl.load(sin_ptr + sin_offset, mask=block_mask, other=0.0)
-        
-        # Load first half (x1) and second half (x2) of the input
-        x1_offset = base_offset + block_start + tl.arange(0, BLOCK_SIZE)
-        x2_offset = base_offset + half_d_k + block_start + tl.arange(0, BLOCK_SIZE)
-        
-        x1 = tl.load(x_ptr + x1_offset, mask=block_mask, other=0.0)
-        x2 = tl.load(x_ptr + x2_offset, mask=block_mask, other=0.0)
-        
-        # Apply RoPE transformation
-        # y1 = x1 * cos + x2 * sin
-        # y2 = x1 * (-sin) + x2 * cos
-        y1 = x1 * cos_vals + x2 * sin_vals
-        y2 = x1 * (-sin_vals) + x2 * cos_vals
-        
-        # Store results
-        y1_offset = base_offset + block_start + tl.arange(0, BLOCK_SIZE)
-        y2_offset = base_offset + half_d_k + block_start + tl.arange(0, BLOCK_SIZE)
-        
-        tl.store(output_ptr + y1_offset, y1, mask=block_mask)
-        tl.store(output_ptr + y2_offset, y2, mask=block_mask)
+    # Create index ranges for the block
+    idx_range = tl.arange(0, BLOCK_SIZE)
+    mask = idx_range < half_d_k
+    
+    # Load cos and sin values
+    cos_offset = cos_sin_base + idx_range
+    sin_offset = cos_sin_base + idx_range
+    
+    cos_vals = tl.load(cos_ptr + cos_offset, mask=mask, other=0.0)
+    sin_vals = tl.load(sin_ptr + sin_offset, mask=mask, other=0.0)
+    
+    # Load first half (x1) and second half (x2) of the input
+    x1_offset = base_offset + idx_range
+    x2_offset = base_offset + half_d_k + idx_range
+    
+    x1 = tl.load(x_ptr + x1_offset, mask=mask, other=0.0)
+    x2 = tl.load(x_ptr + x2_offset, mask=mask, other=0.0)
+    
+    # Apply RoPE transformation
+    # y1 = x1 * cos + x2 * sin
+    # y2 = x1 * (-sin) + x2 * cos
+    y1 = x1 * cos_vals + x2 * sin_vals
+    y2 = x1 * (-sin_vals) + x2 * cos_vals
+    
+    # Store results
+    y1_offset = base_offset + idx_range
+    y2_offset = base_offset + half_d_k + idx_range
+    
+    tl.store(output_ptr + y1_offset, y1, mask=mask)
+    tl.store(output_ptr + y2_offset, y2, mask=mask)
 
 
 class TritonRoPE(torch.nn.Module):
