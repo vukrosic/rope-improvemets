@@ -9,13 +9,106 @@ import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
 import time
-from transformers import AutoTokenizer
-from dataclasses import dataclass
+from transformers import AutoTokenizerrom dataclasses import dataclass
 from typing import List, Optional
 import warnings
 import os
 import pickle
+import triton
+import triton.language as tl
 warnings.filterwarnings('ignore')
+
+# V2 Kernel: 2D grid, 1D blocking
+@triton.jit
+def rope_forward_kernel_v2(
+    x_ptr, out_ptr,
+    cos_ptr, sin_ptr,
+    stride_x_batch, stride_x_head, stride_x_seq, stride_x_dim,
+    stride_out_batch, stride_out_head, stride_out_seq, stride_out_dim,
+    stride_cos_seq, stride_cos_dim,
+    stride_sin_seq, stride_sin_dim,
+    n_heads: tl.constexpr, seq_len: tl.constexpr, head_dim: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr
+):
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    pid_batch = pid_bh // n_heads
+    pid_head = pid_bh % n_heads
+
+    x_base = x_ptr + pid_batch * stride_x_batch + pid_head * stride_x_head + pid_s * stride_x_seq
+    out_base = out_ptr + pid_batch * stride_out_batch + pid_head * stride_out_head + pid_s * stride_out_seq
+    cos_base = cos_ptr + pid_s * stride_cos_seq
+    sin_base = sin_ptr + pid_s * stride_sin_seq
+
+    d_offsets = tl.arange(0, BLOCK_SIZE_D)
+    half_d = head_dim // 2
+
+    x1_ptr = x_base + d_offsets
+    x2_ptr = x_base + half_d + d_offsets
+
+    cos_ptr_ = cos_base + d_offsets
+    sin_ptr_ = sin_base + d_offsets
+
+    mask = d_offsets < half_d
+
+    x1 = tl.load(x1_ptr, mask=mask, other=0.0)
+    x2 = tl.load(x2_ptr, mask=mask, other=0.0)
+    cos = tl.load(cos_ptr_, mask=mask, other=0.0)
+    sin = tl.load(sin_ptr_, mask=mask, other=0.0)
+
+    y1 = x1 * cos + x2 * sin
+    y2 = -x1 * sin + x2 * cos
+
+    tl.store(out_base + d_offsets, y1, mask=mask)
+    tl.store(out_base + half_d + d_offsets, y2, mask=mask)
+
+# V4 Kernel: V2 with float32 calculations
+@triton.jit
+def rope_forward_kernel_v4(
+    x_ptr, out_ptr,
+    cos_ptr, sin_ptr,
+    stride_x_batch, stride_x_head, stride_x_seq, stride_x_dim,
+    stride_out_batch, stride_out_head, stride_out_seq, stride_out_dim,
+    stride_cos_seq, stride_cos_dim,
+    stride_sin_seq, stride_sin_dim,
+    n_heads: tl.constexpr, seq_len: tl.constexpr, head_dim: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr
+):
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    pid_batch = pid_bh // n_heads
+    pid_head = pid_bh % n_heads
+
+    x_base = x_ptr + pid_batch * stride_x_batch + pid_head * stride_x_head + pid_s * stride_x_seq
+    out_base = out_ptr + pid_batch * stride_out_batch + pid_head * stride_out_head + pid_s * stride_out_seq
+    cos_base = cos_ptr + pid_s * stride_cos_seq
+    sin_base = sin_ptr + pid_s * stride_sin_seq
+
+    d_offsets = tl.arange(0, BLOCK_SIZE_D)
+    half_d = head_dim // 2
+
+    x1_ptr = x_base + d_offsets
+    x2_ptr = x_base + half_d + d_offsets
+
+    cos_ptr_ = cos_base + d_offsets
+    sin_ptr_ = sin_base + d_offsets
+
+    mask = d_offsets < half_d
+
+    x1 = tl.load(x1_ptr, mask=mask, other=0.0).to(tl.float32)
+    x2 = tl.load(x2_ptr, mask=mask, other=0.0).to(tl.float32)
+    cos = tl.load(cos_ptr_, mask=mask, other=0.0).to(tl.float32)
+    sin = tl.load(sin_ptr_, mask=mask, other=0.0).to(tl.float32)
+
+    y1 = x1 * cos + x2 * sin
+    y2 = -x1 * sin + x2 * cos
+
+    tl.store(out_base + d_offsets, y1, mask=mask)
+    tl.store(out_base + half_d + d_offsets, y2, mask=mask)
+
+
 
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility"""
@@ -26,6 +119,363 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print(f"🌱 Set all seeds to {seed}")
+
+@dataclass
+class ModelConfig:
+    # Model architecture
+    d_model: int = 384
+    n_heads: int = 8
+    n_layers: int = 6
+    d_ff: int = 1536
+    batch_size: int = 24
+    max_steps: int = 3000
+
+    # Training parameters
+    gradient_accumulation_steps: int = 4
+    muon_lr: float = 0.01
+
+    # Data parameters
+    max_seq_len: int = 512
+    num_documents: int = 2000
+    max_tokens: int = 500000
+
+    # Evaluation
+    eval_every: int = 500
+    eval_steps: int = 100
+
+    # Regularization
+    weight_decay: float = 0.1
+    dropout: float = 0.1
+    grad_clip: float = 1.0
+
+    # Technical
+    use_amp: bool = True
+    vocab_size: Optional[int] = None
+    rope_implementation: str = 'pytorch'
+
+    def __post_init__(self):
+        self.d_k = self.d_model // self.n_heads
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+
+class PyTorchRoPE(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int, correct_impl: bool = True):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.correct_impl = correct_impl
+
+        if self.correct_impl:
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+            t = torch.arange(max_seq_len, dtype=torch.float32)
+            freqs = torch.einsum('i,j->ij', t, inv_freq)
+            self.register_buffer('cos', freqs.cos(), persistent=False)
+            self.register_buffer('sin', freqs.sin(), persistent=False)
+        else: # Buggy implementation from original llm.py
+            angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+            angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+            t = torch.arange(max_seq_len, dtype=torch.float32)
+            theta = torch.einsum("i,j -> ij", t, angular_freq)
+            self.register_buffer('cos', theta.cos(), persistent=False)
+            self.register_buffer('sin', theta.sin(), persistent=False)
+
+    def forward(self, x_BTHD: torch.Tensor) -> torch.Tensor:
+        cos = self.cos[None, :x_BTHD.size(-3), None, :].to(x_BTHD.dtype)
+        sin = self.sin[None, :x_BTHD.size(-3), None, :].to(x_BTHD.dtype)
+        
+        x1, x2 = x_BTHD.chunk(2, dim=-1)
+        if self.correct_impl:
+            y1 = x1 * cos - x2 * sin
+            y2 = x1 * sin + x2 * cos
+        else: # Buggy implementation
+            y1 = x1 * cos + x2 * sin
+            y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), -1)
+
+class TritonRoPEV2(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
+        self.register_buffer('cos', freqs.cos(), persistent=False)
+        self.register_buffer('sin', freqs.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, n_heads, seq_len, head_dim = x.shape
+        output = torch.empty_like(x)
+        cos_seq = self.cos[:seq_len].contiguous()
+        sin_seq = self.sin[:seq_len].contiguous()
+
+        grid = lambda META: (batch_size * n_heads, seq_len)
+        
+        rope_forward_kernel_v2[grid](
+            x, output,
+            cos_seq, sin_seq,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+            cos_seq.stride(0), cos_seq.stride(1),
+            sin_seq.stride(0), sin_seq.stride(1),
+            n_heads=n_heads, seq_len=seq_len, head_dim=head_dim,
+            BLOCK_SIZE_D=triton.next_power_of_2(head_dim // 2)
+        )
+        return output
+
+class TritonRoPEV4(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
+        self.register_buffer('cos', freqs.cos(), persistent=False)
+        self.register_buffer('sin', freqs.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, n_heads, seq_len, head_dim = x.shape
+        output = torch.empty_like(x)
+        cos_seq = self.cos[:seq_len].contiguous()
+        sin_seq = self.sin[:seq_len].contiguous()
+
+        grid = lambda META: (batch_size * n_heads, seq_len)
+        
+        rope_forward_kernel_v4[grid](
+            x, output,
+            cos_seq, sin_seq,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+            cos_seq.stride(0), cos_seq.stride(1),
+            sin_seq.stride(0), sin_seq.stride(1),
+            n_heads=n_heads, seq_len=seq_len, head_dim=head_dim,
+            BLOCK_SIZE_D=triton.next_power_of_2(head_dim // 2)
+        )
+        return output
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1, rope_implementation: nn.Module = None):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.w_o = nn.Linear(d_model, d_model, bias=False)
+        self.rotary = rope_implementation
+        self.dropout = dropout
+
+    def forward(self, x):
+        batch_size, seq_len = x.size(0), x.size(1)
+
+        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        Q, K, V = qkv[0], qkv[1], qkv[2]
+
+        Q = self.rotary(Q)
+        K = self.rotary(K)
+
+        attn_output = F.scaled_dot_product_attention(
+            Q, K, V, is_causal=True, dropout_p=self.dropout if self.training else 0.0
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
+        return self.w_o(attn_output)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1, rope_implementation: nn.Module = None):
+        super().__init__()
+        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout, rope_implementation)
+        self.feed_forward = FeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        attn_out = self.attention(self.norm1(x))
+        x = x + self.dropout(attn_out)
+        ff_out = self.feed_forward(self.norm2(x))
+        x = x + self.dropout(ff_out)
+        return x
+
+class MinimalLLM(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.position_dropout = nn.Dropout(config.dropout)
+
+        rope_implementations = {
+            'pytorch': PyTorchRoPE(self.config.d_k, self.config.max_seq_len, correct_impl=False),
+            'triton_v2': TritonRoPEV2(self.config.d_k, self.config.max_seq_len),
+            'triton_v4': TritonRoPEV4(self.config.d_k, self.config.max_seq_len)
+        }
+        rope_implementation = rope_implementations[config.rope_implementation]
+
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout, rope_implementation)
+            for _ in range(config.n_layers)
+        ])
+
+        self.norm = nn.RMSNorm(config.d_model)
+        self.output_dropout = nn.Dropout(config.dropout)
+
+        # Tie weights
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head.weight = self.token_embedding.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, x):
+        x = self.token_embedding(x) * math.sqrt(self.config.d_model)
+        x = self.position_dropout(x)
+
+        for block in self.transformer_blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        x = self.output_dropout(x)
+        logits = self.lm_head(x)
+        return logits
+
+def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
+    """Train the model with Muon optimizer"""
+    print(f"
+🚀 Training Small model with RoPE implementation: {config.rope_implementation}")
+
+    # Initialize model
+    set_seed(42)
+    model = MinimalLLM(config)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  📊 Total parameters: {total_params:,}")
+
+    # Setup optimizers
+    optimizers = [torch.optim.AdamW(model.parameters(), lr=config.muon_lr*0.1, weight_decay=config.weight_decay)]
+
+    # Learning rate schedule
+    schedulers = []
+    for optimizer in optimizers:
+        warmup_steps = config.max_steps // 20
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            else:
+                progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
+                return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        schedulers.append(scheduler)
+
+    scaler = GradScaler() if config.use_amp else None
+
+    # Training loop
+    model.train()
+    step = 0
+    start_time = time.time()
+    
+    pbar = tqdm(total=config.max_steps, desc="Training")
+
+    while step < config.max_steps:
+        for batch_idx, (x, y) in enumerate(train_loader):
+            if step >= config.max_steps:
+                break
+
+            x, y = x.to(device), y.to(device)
+
+            # Forward pass with gradient accumulation
+            with autocast(enabled=config.use_amp):
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+                loss = loss / config.gradient_accumulation_steps
+            
+            scaler.scale(loss).backward()
+
+            # Optimizer step after accumulation
+            if (step + 1) % config.gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizers[0])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                
+                for optimizer in optimizers:
+                    scaler.step(optimizer)
+                    optimizer.zero_grad()
+                for scheduler in schedulers:
+                    scheduler.step()
+                scaler.update()
+
+            step += 1
+            pbar.update(1)
+
+    pbar.close()
+
+    training_time = time.time() - start_time
+    print(f"  ⏱️ Training completed in {training_time:.1f} seconds")
+
+    # Final evaluation
+    final_eval = evaluate_model(model, val_loader, config)
+    print(f"  📊 Final - Loss: {final_eval['val_loss']:.4f}, "
+          f"Acc: {final_eval['val_accuracy']:.4f}, PPL: {final_eval['val_perplexity']:.2f}")
+
+    return training_time, final_eval
+
+if __name__ == "__main__":
+    # Check system
+    print(f"🔍 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # Set seed
+    set_seed(42)
+
+    # Create config for Small model
+    config = ModelConfig()
+    
+    # Load data
+    texts, tokenizer, tokens = load_and_cache_data(config)
+    dataset = TextTokenDataset(tokens, config.max_seq_len)
+
+    # Train/val split
+    val_size = len(dataset) // 10
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2)
+
+    print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
+
+    results = {}
+    implementations_to_test = ['pytorch', 'triton_v2', 'triton_v4']
+
+    for impl in implementations_to_test:
+        config.rope_implementation = impl
+        training_time, final_metrics = train_model(config, train_loader, val_loader)
+        results[impl] = {
+            'training_time': training_time,
+            'val_loss': final_metrics['val_loss'],
+            'val_accuracy': final_metrics['val_accuracy'],
+            'val_perplexity': final_metrics['val_perplexity']
+        }
+
+    print("\n--- Benchmark Summary ---")
+    print(f"{ 'Implementation':<20} | { 'Training Time (s)':<20} | { 'Val Loss':<15} | { 'Val Accuracy':<15} | { 'Val Perplexity':<15}")
+    print("-" * 90)
+    for impl, res in results.items():
+        print(f"{impl:<20} | {res['training_time']:<20.2f} | {res['val_loss']:<15.4f} | {res['val_accuracy']:<15.4f} | {res['val_perplexity']:<15.2f}")
+
 
 @dataclass
 class ModelConfig:

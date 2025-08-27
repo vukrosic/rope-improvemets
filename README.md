@@ -83,3 +83,36 @@ The results are definitive:
 1.  **Adopt Triton V2:** The `Triton V2` kernel should be adopted as the optimized implementation.
 2.  **Integrate into `llm.py`:** The next logical step is to replace the original, buggy RoPE implementation in `llm.py` with the `Triton V2` kernel.
 3.  **End-to-End Benchmark:** After integration, a full training run should be performed to measure the impact on overall training time and memory usage. This will quantify the real-world benefits of this optimization.
+
+## Triton Kernel V3 and V4 Benchmark
+
+### Objective
+
+To further refine the Triton kernel, I benchmarked two more variations against the previous winner (`V2`):
+- **Triton V3**: A kernel using a 3D grid to increase parallelism over the head dimension.
+- **Triton V4 (fp32)**: A kernel identical to `V2` but using `float32` for internal calculations to check the trade-off between performance and precision.
+
+### Benchmark Results
+
+| Config             | Pytorch (ms) | Triton V2 (ms) | Triton V3 (ms) | Triton V4 (fp32) (ms) |
+|--------------------|--------------|----------------|----------------|-----------------------|
+| 4x12x512x64        | 0.069        | 0.036          | 0.033          | 0.033                 |
+| 8x16x1024x64       | 0.076        | 0.067          | 0.067          | 0.067                 |
+| 2x16x512x128       | 0.068        | 0.034          | 0.033          | 0.033                 |
+| 4x16x1024x128      | 0.076        | 0.035          | 0.067          | 0.035                 |
+| 2x16x2048x256      | 0.251        | 0.064          | 0.133          | 0.064                 |
+| 4x16x4096x256      | 1.355        | 0.299          | 0.507          | 0.300                 |
+
+### Report and Analysis
+
+1.  **`V2` and `V4` are the Champions**: The `Triton V2` kernel and its `float32` counterpart, `V4`, are the most performant and robust implementations. They consistently outperform PyTorch by a large margin (up to **4.5x** on the largest configuration).
+
+2.  **`V4` Offers Free Precision**: The `V4` kernel, which forces internal calculations to `float32`, shows virtually identical performance to `V2`. This is an excellent result, as it means we can gain the extra precision of `float32` without any performance penalty. This makes `V4` the most desirable kernel.
+
+3.  **3D Grid (`V3`) is Not a Clear Win**: The `V3` kernel, which uses a 3D grid, is competitive on some smaller configurations but loses to `V2`/`V4` on larger ones. This indicates that the overhead of managing the third grid dimension outweighs the benefits of increased parallelism in many cases. The simpler 2D grid of `V2`/`V4` is a more effective and generalizable strategy.
+
+### Final Conclusion and Next Steps
+
+After several iterations, the `Triton V4` kernel is the best implementation. It's fast, robust across many configurations, and offers the precision of `float32` at no extra cost.
+
+The research on kernel optimization is now complete. The next and final step is to integrate this winning kernel into the main `llm.py` model.
