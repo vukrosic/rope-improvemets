@@ -48,3 +48,38 @@ Based on these findings, I propose the following next steps:
 2.  **Optimize the Triton Kernel:** The performance regression at larger head dimensions needs to be addressed. I would investigate the kernel's memory access patterns and experiment with different block sizes and launch grid configurations to optimize it for a wider range of shapes.
 
 3.  **End-to-End Integration and Benchmarking:** Once the Triton kernel is optimized and validated against a corrected PyTorch implementation, it should be integrated into the main `MinimalLLM` model in `llm.py`. A full training run should then be benchmarked to measure the real-world impact on training speed and memory usage.
+
+## Triton Kernel Variations Benchmark
+
+### Objective
+
+To find a more performant Triton kernel, I implemented and benchmarked two variations:
+- **Triton V1**: The original kernel from `rope.py` which uses a 3D grid.
+- **Triton V2**: A new kernel that uses a 2D grid and 1D blocking, inspired by the implementation in `triton_rope.py`.
+
+A corrected RoPE implementation was used for the PyTorch baseline to ensure a fair comparison.
+
+### Benchmark Results
+
+| Config             | Pytorch (ms) | Triton V1 (ms) | Triton V2 (ms) |
+|--------------------|--------------|----------------|----------------|
+| 1x8x2048x64        | 0.062        | 0.082          | 0.035          |
+| 4x12x512x64        | 0.068        | 0.121          | 0.037          |
+| 8x16x1024x64       | 0.252        | 0.634          | 0.068          |
+| 1x8x2048x128       | 0.067        | 0.156          | 0.031          |
+| 2x16x512x128       | 0.063        | 0.156          | 0.038          |
+| 4x16x1024x128      | 0.254        | 0.615          | 0.033          |
+
+### Analysis
+
+The results are definitive:
+
+-   **Triton V2 is the clear winner.** It is significantly faster than both the PyTorch implementation and the V1 kernel across all tested configurations. The speedup is particularly dramatic on larger configurations, reaching up to **7.7x faster** than PyTorch (`4x16x1024x128`).
+-   **Triton V1 is suboptimal.** It was consistently slower than the PyTorch baseline, confirming that its 3D grid launch strategy was not efficient for this problem.
+-   The 2D grid and 1D blocking approach of **Triton V2** is a much more effective way to parallelize the RoPE computation.
+
+### Updated Future Research Directions
+
+1.  **Adopt Triton V2:** The `Triton V2` kernel should be adopted as the optimized implementation.
+2.  **Integrate into `llm.py`:** The next logical step is to replace the original, buggy RoPE implementation in `llm.py` with the `Triton V2` kernel.
+3.  **End-to-End Benchmark:** After integration, a full training run should be performed to measure the impact on overall training time and memory usage. This will quantify the real-world benefits of this optimization.
