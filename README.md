@@ -1,5 +1,9 @@
 # Optimizing Rotary Position Embeddings: A Journey with PyTorch, Triton, and a Surprising Bug
 
+YouTube - https://youtu.be/Brmh5Lh3qXw
+
+Bilibili (中文版) - https://www.bilibili.com/video/BV1ZEeUzPETY/
+
 ## Introduction
 
 This document chronicles the process of optimizing the Rotary Position Embedding (RoPE) implementation in a small Language Model. What began as a straightforward performance optimization task using Triton turned into a deep dive into the nuances of kernel programming and a surprising discovery about the model's behavior.
