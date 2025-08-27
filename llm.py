@@ -17,13 +17,6 @@ import os
 import pickle
 warnings.filterwarnings('ignore')
 
-# Try to import Triton RoPE, fallback to original if not available
-try:
-    from triton_rope import TritonRoPE
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility"""
     random.seed(seed)
@@ -64,7 +57,6 @@ class ModelConfig:
 
     # Technical
     use_amp: bool = True
-    use_triton_rope: bool = True  # Enable Triton-optimized RoPE
     vocab_size: Optional[int] = None
 
     def __post_init__(self):
@@ -206,7 +198,7 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1, use_triton_rope: bool = True):
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -214,16 +206,7 @@ class MultiHeadAttention(nn.Module):
 
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
-        
-        # Use Triton RoPE if available and requested, otherwise fallback to original
-        if use_triton_rope and TRITON_AVAILABLE and torch.cuda.is_available():
-            self.rotary = TritonRoPE(self.d_k, max_seq_len)
-            print(f"🚀 Using Triton-optimized RoPE for head dimension {self.d_k}")
-        else:
-            self.rotary = Rotary(self.d_k, max_seq_len)
-            if use_triton_rope:
-                print(f"⚠️  Triton not available, using original RoPE")
-        
+        self.rotary = Rotary(self.d_k, max_seq_len)
         self.dropout = dropout
 
     def forward(self, x):
@@ -253,9 +236,9 @@ class FeedForward(nn.Module):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1, use_triton_rope: bool = True):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout, use_triton_rope)
+        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
         self.feed_forward = FeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
@@ -277,7 +260,7 @@ class MinimalLLM(nn.Module):
         self.position_dropout = nn.Dropout(config.dropout)
 
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout, config.use_triton_rope)
+            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout)
             for _ in range(config.n_layers)
         ])
 
