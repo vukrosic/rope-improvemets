@@ -35,7 +35,7 @@ def rope_kernel(
     seq_idx = pid_seq
     
     # Early exit if out of bounds
-    if batch_idx >= batch_size or head_idx >= n_heads or seq_idx >= seq_len:
+    if (batch_idx >= batch_size) or (head_idx >= n_heads) or (seq_idx >= seq_len):
         return
     
     # Calculate half dimension
