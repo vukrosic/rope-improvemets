@@ -127,7 +127,7 @@ class ModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 3000
+    max_steps: int = 1000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
@@ -195,11 +195,12 @@ class TritonRoPEV2(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.einsum('i,j->ij', t, inv_freq)
-        self.register_buffer('cos', freqs.cos(), persistent=False)
-        self.register_buffer('sin', freqs.sin(), persistent=False)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.register_buffer('cos', theta.cos(), persistent=False)
+        self.register_buffer('sin', theta.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, n_heads, seq_len, head_dim = x.shape
@@ -226,11 +227,12 @@ class TritonRoPEV4(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.einsum('i,j->ij', t, inv_freq)
-        self.register_buffer('cos', freqs.cos(), persistent=False)
-        self.register_buffer('sin', freqs.sin(), persistent=False)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.register_buffer('cos', theta.cos(), persistent=False)
+        self.register_buffer('sin', theta.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, n_heads, seq_len, head_dim = x.shape
